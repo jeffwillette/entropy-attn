@@ -33,7 +33,7 @@ def is_hopper():
 def _attn_fwd_inner(acc, l_i, m_i, e_i, q,  #
                     desc_k, desc_v,  #
                     offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
-                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, TEMP: tl.constexpr, BLOCK_N: tl.constexpr,  #
+                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
                     N_CTX: tl.constexpr, warp_specialize: tl.constexpr, IS_HOPPER: tl.constexpr):
     # range of values handled by this stage
@@ -55,15 +55,15 @@ def _attn_fwd_inner(acc, l_i, m_i, e_i, q,  #
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         k = desc_k.load([offsetk_y, 0]).T
-        qk = tl.dot(q, k) / TEMP
+        qk = tl.dot(q, k)
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+            qk = qk * qk_scale[:, None] + tl.where(mask, 0, -1.0e6)
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
         else:
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, None]
+            qk = qk * qk_scale[:, None] - m_ij[:, None]
         p = tl.math.exp2(qk)
         # -- compute correction factor
         alpha = tl.math.exp2(m_i - m_ij)
@@ -166,9 +166,8 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M, E,  #
-              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+              Z, H, desc_q, desc_k, desc_v, desc_o, TEMP, N_CTX,  #
               HEAD_DIM: tl.constexpr,  #
-              TEMP: tl.constexpr,
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
               FP8_OUTPUT: tl.constexpr,  #
@@ -198,6 +197,7 @@ def _attn_fwd(sm_scale, M, E,  #
     desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
 
+    offset_temp = off_z * (N_CTX * H) + off_h * N_CTX + (start_m * BLOCK_M + tl.arange(0, BLOCK_M))
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
     qo_offset_y = offset_y + start_m * BLOCK_M
     # initialize offsets
@@ -210,7 +210,8 @@ def _attn_fwd(sm_scale, M, E,  #
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     # load scales
     qk_scale = sm_scale
-    qk_scale *= 1.44269504 # 1/log(2) --> because 2^(x / ln2) == e^x
+    t = tl.load(TEMP + offset_temp)
+    qk_scale *= 1.44269504 * (1 / t) # 1.44.. ~ 1/log(2) --> because 2^(x / ln2) == e^x
     # load q: it will stay in SRAM throughout
     q = desc_q.load([qo_offset_y, 0])
     # stage 1: off-band
@@ -220,7 +221,7 @@ def _attn_fwd(sm_scale, M, E,  #
         acc, l_i, m_i, e_i = _attn_fwd_inner(acc, l_i, m_i, e_i, q,  #
                                         desc_k, desc_v,  #
                                         offset_y, dtype, start_m, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM, TEMP, BLOCK_N,  #
+                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX,  #
                                         warp_specialize, IS_HOPPER)
     # stage 2: on-band
@@ -228,7 +229,7 @@ def _attn_fwd(sm_scale, M, E,  #
         acc, l_i, m_i, e_i = _attn_fwd_inner(acc, l_i, m_i, e_i, q,  #
                                         desc_k, desc_v,  #
                                         offset_y, dtype, start_m, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM, TEMP, BLOCK_N,  #
+                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX,  #
                                         warp_specialize, IS_HOPPER)
     # epilogue
@@ -505,6 +506,10 @@ class _attention(torch.autograd.Function):
         if q.size(2) == 1 and not decode:
             decode = True
 
+        assert len(temp.size()) == 3, f"temperature vector must be Z, H, N_CTX"
+
+        temp = temp.contiguous()
+
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -541,7 +546,7 @@ class _attention(torch.autograd.Function):
                 k_idx = torch.arange(k.shape[2], device=q.device).view(1, 1, 1, -1)
                 causal_mask = (q_idx + base_pos) >= k_idx
                 attn_scores = attn_scores.masked_fill(~causal_mask, float("-inf"))
-            attn = torch.softmax(attn_scores / temp, dim=-1)
+            attn = torch.softmax(attn_scores / temp.unsqueeze(-1), dim=-1)
             o = torch.matmul(attn, v.to(torch.float32)).to(q.dtype)
             entropy = -(attn * torch.log(attn + 1e-9)).sum(dim=-1).to(torch.float32)
             E.copy_(entropy)
@@ -585,10 +590,9 @@ class _attention(torch.autograd.Function):
             _attn_fwd[grid](
                 sm_scale, M, E,  #
                 q.shape[0], q.shape[1],  #
-                desc_q, desc_k, desc_v, desc_o,  #
+                desc_q, desc_k, desc_v, desc_o, temp,  #
                 N_CTX=q.shape[2],  #
                 HEAD_DIM=HEAD_DIM_K,  #
-                TEMP=temp,
                 FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
                 STAGE=stage,  #
                 warp_specialize=warp_specialize,  #
