@@ -61,7 +61,7 @@ if __name__ == "__main__":
     for i in range(10):
         device = "cuda:0"
         dtype = torch.float16
-        Z, H, N_CTX = 4, 8, 512
+        Z, H, N_CTX = 4, 8, 512 + 7
         temp = torch.rand(Z, H, N_CTX, device=device, dtype=dtype).clamp(min=0.1)
         test_prefill(Z=Z, H=H, N_CTX=N_CTX, temp=temp, dtype=dtype)
         test_decode(Z=Z, H=H, N_CTX=N_CTX, temp=temp[:, :, :1], dtype=dtype)
