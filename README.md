@@ -10,7 +10,7 @@
 ## To run on RULER with baseline flash_attention_2
 `CUDA_VISIBLE_DEVICES=[device_num] python run_ruler_eval_timed.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --data_root [path_to_input_data] \
+  --data_root [data_path] \
   --tasks [qa_task] \
   --max_new_tokens 64 \
   --compact \
@@ -25,7 +25,7 @@
 ## To run on RULER with entropy_attn kernel
 `CUDA_VISIBLE_DEVICES=[device_num] python run_ruler_eval_timed.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --data_root [path_to_input_data] \
+  --data_root [data_path] \
   --tasks [qa_task] \
   --max_new_tokens 64 \
   --compact \
