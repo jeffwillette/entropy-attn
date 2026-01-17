@@ -161,11 +161,11 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
-@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "dtype", "warp_specialize"],
+@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX_BUCKET", "HEAD_DIM", "dtype", "warp_specialize"],
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M, E,  #
-              Z, H, desc_q, desc_k, desc_v, O, TEMP, N_CTX,  #
+              Z, H, desc_q, desc_k, desc_v, O, TEMP, N_CTX, N_CTX_BUCKET,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
@@ -503,6 +503,10 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     tl.store(dq_ptrs, dq)
 
 
+def bucket_1024(n: int) -> int:
+    return ((n + 1023) // 1024) * 1024   # ceil to next multiple of 1024
+
+
 class _attention(torch.autograd.Function):
 
     @staticmethod
@@ -604,6 +608,7 @@ class _attention(torch.autograd.Function):
                 q.shape[0], q.shape[1],  #
                 desc_q, desc_k, desc_v, o, temp,  #
                 N_CTX=q.shape[2],  #
+                N_CTX_BUCKET=bucket_1024(q.shape[2]),
                 HEAD_DIM=HEAD_DIM_K,  #
                 dtype=DTYPE,
                 FP8_OUTPUT=DTYPE == tl.float8e5,
